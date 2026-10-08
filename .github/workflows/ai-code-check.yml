@@ -1,0 +1,202 @@
+name: AI-generated code check
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scan PR for AI-generated code cues
+        uses: actions/github-script@v7
+        env:
+          REVIEWER: wvffle
+        with:
+          script: |
+            const reviewer = process.env.REVIEWER;
+            const pr = context.payload.pull_request;
+            if (!pr) { core.info('Not a pull request event, skipping.'); return; }
+
+            const { owner, repo } = context.repo;
+            const MARKER = '<!-- ai-code-check -->';
+            const MAX_FINDINGS = 50;
+            const findings = [];
+            const seen = new Set();
+
+            // level: 'Definitive' = the tool left its own signature
+            //        'Strong'     = text that only appears when chatbot output is pasted
+            //        'Moderate'   = common AI artifact, but a human could produce it
+            const add = (level, cue, where, evidence) => {
+              const key = `${cue}|${where}|${evidence}`;
+              if (seen.has(key) || findings.length >= MAX_FINDINGS) return;
+              seen.add(key);
+              findings.push({ level, cue, where, evidence });
+            };
+
+            const AI_NAMES = /(claude|anthropic|copilot|chatgpt|openai|codex|cursor|devin|aider|gemini|windsurf|codeium|tabnine|codewhisperer|amazon q|jules)/i;
+            const TOOL_SIGNATURE = /(generated|created|written) (with|by) .*(claude|copilot|cursor|aider|codex|chatgpt|gemini|devin|windsurf)/i;
+
+            // ---------- 1. Commits ----------
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+
+            for (const c of commits) {
+              const sha = c.sha.slice(0, 7);
+              const msg = c.commit.message || '';
+
+              for (const m of msg.matchAll(/^co-authored-by:\s*(.+)$/gim)) {
+                if (AI_NAMES.test(m[1])) {
+                  add('Definitive', 'AI co-author trailer', `commit ${sha}`, `Co-authored-by: ${m[1].trim()}`);
+                }
+              }
+              const sig = msg.match(TOOL_SIGNATURE);
+              if (sig) add('Definitive', 'AI tool signature in commit message', `commit ${sha}`, sig[0]);
+
+              const logins = new Set([c.author?.login, c.committer?.login].filter(Boolean));
+              for (const login of logins) {
+                if (login.endsWith('[bot]') && AI_NAMES.test(login)) {
+                  add('Definitive', 'Commit made by an AI agent account', `commit ${sha}`, login);
+                }
+              }
+            }
+
+            // ---------- 2. PR metadata ----------
+            const bodySig = (pr.body || '').match(TOOL_SIGNATURE);
+            if (bodySig) add('Definitive', 'AI tool signature in PR description', 'PR description', bodySig[0]);
+
+            if (/^(copilot|claude|cursor|devin|codex|jules)\//i.test(pr.head.ref)) {
+              add('Moderate', 'Branch name used by AI coding agents', 'head branch', pr.head.ref);
+            }
+
+            // ---------- 3. Changed files ----------
+            const AGENT_FILES = [
+              /(^|\/)CLAUDE\.md$/i, /(^|\/)\.claude\//, /(^|\/)GEMINI\.md$/i, /(^|\/)AGENTS\.md$/i,
+              /(^|\/)\.cursorrules$/, /(^|\/)\.cursor\//, /(^|\/)\.windsurfrules$/,
+              /(^|\/)\.aider/, /(^|\/)\.github\/copilot-instructions\.md$/,
+            ];
+
+            const PHRASES = [
+              [/as an ai (language )?model/i,                                     'Strong',     'Chatbot self-reference'],
+              [/as a large language model/i,                                      'Strong',     'Chatbot self-reference'],
+              [/<\|(im_start|im_end|endoftext)\|>/,                               'Definitive', 'Model special token'],
+              [/oaicite|contentReference\[/,                                      'Definitive', 'ChatGPT citation artifact'],
+              [/\bmy (knowledge|training) cutoff\b/i,                             'Strong',     'Chatbot self-reference'],
+              [/\bi hope this helps\b/i,                                          'Strong',     'Chat reply sign-off'],
+              [/\b(certainly|sure|absolutely|of course)!?,? here('s| is| are)\b/i, 'Strong',     'Chat reply opener'],
+              [/here('s| is) (the|your) (updated|corrected|modified|complete|full|revised|refactored|fixed) (code|version|implementation|file|function)/i,
+                                                                                  'Strong',     'Chat reply framing'],
+              [/(rest of|remainder of) the (code|file|implementation|class) (remains|stays|is) (the same|unchanged)/i,
+                                                                                  'Strong',     'Elided-code placeholder'],
+              [/\.\.\.\s*(rest of|existing|remaining|other|previous) (the )?(code|implementation|methods|functions|logic|file)/i,
+                                                                                  'Strong',     'Elided-code placeholder'],
+              [/\b(let me know if you('d| would) like|feel free to (ask|adjust|modify))\b/i,
+                                                                                  'Moderate',   'Chat reply sign-off'],
+            ];
+
+            const PROSE_FILE = /\.(md|mdx|markdown|rst|txt|adoc)$/i;
+            const SELF = /(^|\/)\.github\/workflows\/ai-code-check\.ya?ml$/;
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+
+            for (const f of files) {
+              if (SELF.test(f.filename)) continue; // this file contains the patterns itself
+
+              if (f.status === 'added' && AGENT_FILES.some((re) => re.test(f.filename))) {
+                add('Moderate', 'AI agent config/instructions file added', f.filename, f.filename);
+              }
+              if (!f.patch) continue; // binary or too large for the API diff
+
+              let newLine = 0;
+              for (const raw of f.patch.split('\n')) {
+                const hunk = raw.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+                if (hunk) { newLine = Number(hunk[1]); continue; }
+                if (raw.startsWith('-')) continue;
+                if (raw.startsWith('+')) {
+                  const line = raw.slice(1);
+                  const where = `${f.filename}:${newLine}`;
+                  for (const [re, level, cue] of PHRASES) {
+                    const m = line.match(re);
+                    if (m) add(level, cue, where, line.trim());
+                  }
+                  if (!PROSE_FILE.test(f.filename) && /^\s*```[\w+-]*\s*$/.test(line)) {
+                    add('Moderate', 'Leftover markdown code fence in a source file', where, line.trim());
+                  }
+                }
+                newLine++;
+              }
+            }
+
+            // ---------- 4. Report ----------
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pr.number, per_page: 100,
+            });
+            const existing = comments.find((c) => c.user?.type === 'Bot' && c.body?.includes(MARKER));
+
+            if (findings.length === 0) {
+              core.info('No AI-generated code cues found.');
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: existing.id,
+                  body: `${MARKER}\n### ✅ AI code check: no cues found in the latest push\nThe cues flagged earlier are no longer present.`,
+                });
+              }
+              return;
+            }
+
+            const esc = (s) => s.replace(/\|/g, '\\|').replace(/`/g, "'").slice(0, 140);
+            const order = { Definitive: 0, Strong: 1, Moderate: 2 };
+            findings.sort((a, b) => order[a.level] - order[b.level]);
+
+            const rows = findings
+              .map((f, i) => `| ${i + 1} | **${f.level}** | ${f.cue} | \`${esc(f.where)}\` | \`${esc(f.evidence)}\` |`)
+              .join('\n');
+
+            const levels = new Set(findings.map((f) => f.level));
+            const why = [];
+            if (levels.has('Definitive')) why.push('- **Definitive**: the AI tool left its own signature (a co-author trailer, "Generated with" line, agent bot account, model token or citation artifact). These are added by the tools themselves, so they prove an AI tool was involved in this PR.');
+            if (levels.has('Strong'))     why.push('- **Strong**: text that belongs to a chatbot reply, not to code (e.g. "Here\'s the updated code", "rest of the code remains the same"). This almost always means chatbot output was pasted in without cleanup.');
+            if (levels.has('Moderate'))   why.push('- **Moderate**: common AI artifacts that a human could also produce. Treat these as hints, not proof.');
+
+            const body = [
+              MARKER,
+              '### 🚩 AI-generated code cues found',
+              '',
+              `@${reviewer}, this PR contains ${findings.length} cue(s) that suggest AI-generated code and needs your review.`,
+              '',
+              '| # | Confidence | Cue | Where | Evidence |',
+              '|---|---|---|---|---|',
+              rows,
+              findings.length >= MAX_FINDINGS ? `\n_Showing the first ${MAX_FINDINGS} findings._` : '',
+              '',
+              '#### Why these were flagged',
+              ...why,
+              '',
+              '<sub>These checks show that an AI tool was used or its output was pasted in. They don\'t show which lines are AI-written, and a PR without cues is not proof it\'s human-written.</sub>',
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+            }
+
+            if (pr.user.login.toLowerCase() !== reviewer.toLowerCase()) {
+              try {
+                await github.rest.pulls.requestReviewers({
+                  owner, repo, pull_number: pr.number, reviewers: [reviewer],
+                });
+              } catch (e) {
+                core.warning(`Could not request review from @${reviewer}: ${e.message}`);
+              }
+            }
+
+            core.setFailed(`Found ${findings.length} AI-generated code cue(s). See the PR comment for details.`);
